@@ -1,0 +1,503 @@
+第 4 模块里已经讲到了 retrieval\(\) 内部的排序和可选 rerank。第 5 模块不是重复讲“怎么检索”，而是讲：
+
+**检索结果 kbinfos 回到 async\_chat\(\) 后，RAGFlow 如何继续增强、整理成 prompt 需要的知识片段和引用结构。**
+
+```ABAP
+1. toc_enhance
+   用目录结构增强召回 chunks
+
+2. retrieval_by_children
+   把子 chunk / 父 chunk 关系补全
+
+3. web search / KG retrieval 可选补充
+   Tavily 联网搜索
+   KG 知识图谱召回
+
+4. reference metadata enrichment
+   给引用 chunk 补 document metadata
+
+5. kb_prompt()
+   把 chunks 格式化成可塞进 prompt 的 knowledge 文本
+
+6. empty_response 判断
+   如果没有知识片段，是否直接返回空回答
+```
+
+代码位置主要在：
+
+api/db/services/dialog\_service\.py \(line 730\)
+
+```ABAP
+if prompt_config.get("toc_enhance"):
+    cks = await retriever.retrieval_by_toc(...)
+
+kbinfos["chunks"] = retriever.retrieval_by_children(...)
+
+if use_web_search:
+    ...
+
+if prompt_config.get("use_kg"):
+    ...
+
+if include_reference_metadata:
+    ...
+
+knowledges = kb_prompt(kbinfos, max_tokens)
+```
+
+---
+
+上一模块结束时，retriever\.retrieval\(\) 已经返回了：
+
+```ABAP
+kbinfos
+```
+
+它大概长这样：
+
+```JSON
+{
+  "total": 6,
+  "chunks": [
+    {
+      "chunk_id": "chunk_001",
+      "content_with_weight": "员工迟到超过 30 分钟需提交说明...",
+      "doc_id": "doc_001",
+      "docnm_kwd": "员工手册.pdf",
+      "kb_id": "kb_001",
+      "similarity": 0.82,
+      "vector_similarity": 0.76,
+      "term_similarity": 0.85,
+      "positions": [...]
+    }
+  ],
+  "doc_aggs": [
+    {
+      "doc_name": "员工手册.pdf",
+      "doc_id": "doc_001",
+      "count": 4
+    }
+  ]
+}
+```
+
+但是这个结果还不能直接塞给 LLM。
+
+第 5 模块就是继续做几件后处理：
+
+```ABAP
+目录增强
+父子 chunk 补全
+联网搜索补充
+知识图谱补充
+引用 metadata 补充
+转成 prompt 文本
+```
+
+---
+
+### 第一步：可选 TOC 目录增强。
+
+代码在 api/db/services/dialog\_service\.py \(line 730\)：
+
+```ABAP
+if prompt_config.get("toc_enhance"):
+    cks = await retriever.retrieval_by_toc(
+        " ".join(questions),
+        kbinfos["chunks"],
+        tenant_ids,
+        chat_mdl,
+        dialog.top_n
+    )
+    if cks:
+        kbinfos["chunks"] = cks
+```
+
+toc\_enhance 是目录增强。
+
+它的作用是：
+
+如果文档解析时生成了目录结构，RAGFlow 可以利用目录判断“哪些章节更相关”，再补充或调整 chunks。
+
+具体实现看 rag/nlp/search\.py \(line 852\)：
+
+```ABAP
+async def retrieval_by_toc(self, query, chunks, tenant_ids, chat_mdl, topn=6):
+```
+
+它先根据当前召回 chunks 判断最相关的文档：
+
+```ABAP
+for ck in chunks:
+    ranks[ck["doc_id"]] += ck["similarity"]
+
+doc_id = sorted(ranks.items(), key=lambda x: x[1] * -1.)[0][0]
+```
+
+意思是：
+
+```ABAP
+哪个文档的召回分数总和最高，就优先看这个文档的目录
+```
+
+然后它去索引库里找这个文档的 TOC chunk：
+
+```ABAP
+{"doc_id": doc_id, "toc_kwd": "toc"}
+```
+
+如果找到了目录，就调用：
+
+```ABAP
+relevant_chunks_with_toc(query, toc, chat_mdl, topn * 2)
+```
+
+也就是让 LLM 根据目录判断哪些 chunk / 章节更相关。
+
+所以 TOC 增强适合这种情况：
+
+```ABAP
+普通检索命中了某个文档
+但具体章节可能需要目录辅助定位
+```
+
+比如问：
+
+```ABAP
+离职流程是什么？
+```
+
+普通检索命中文档后，目录里可能有：
+
+```ABAP
+第 8 章 离职管理
+第 8.1 节 离职申请
+第 8.2 节 工作交接
+```
+
+TOC 增强就可能把相关章节的 chunks 补进来。
+
+---
+
+### 第二步：父子 chunk 补全。
+
+代码在 api/db/services/dialog\_service\.py \(line 734\)：
+
+```ABAP
+kbinfos["chunks"] = retriever.retrieval_by_children(
+    kbinfos["chunks"],
+    tenant_ids
+)
+```
+
+这个函数在 rag/nlp/search\.py \(line 916\)。
+
+它处理的是一种“子 chunk 命中，但需要返回母 chunk”的情况。
+
+代码里会找：
+
+```ABAP
+mom_id = ck.get("mom_id")
+```
+
+如果某个 chunk 有 mom\_id，说明它是某个母块下面的子块。
+
+逻辑是：
+
+```ABAP
+检索可能命中了细粒度子 chunk
+但展示/回答时可能需要更完整的母 chunk
+```
+
+所以它会：
+
+1. 把有同一个 mom\_id 的子 chunks 收集起来
+
+2. 去索引库里找对应母 chunk
+
+3. 用母 chunk 的 content\_with\_weight 替换/补充回来
+
+4. 相似度用子 chunks 的平均值
+
+5. 最后重新排序
+
+代码在 rag/nlp/search\.py \(line 937\)：
+
+```ABAP
+chunk = self.dataStore.get(id, idx_nms[0], [ck["kb_id"] for ck in cks])
+```
+
+如果母 chunk 找不到，就退回使用子 chunks：
+
+```ABAP
+chunks.extend(cks)
+```
+
+这一步的意义是：
+
+```ABAP
+检索要精准，可以用小 chunk
+回答要完整，可以回到大 chunk
+```
+
+这是一种很常见的 RAG 设计。
+
+---
+
+### 第三步：可选联网搜索补充。
+
+代码在 api/db/services/dialog\_service\.py \(line 735\)：
+
+```SQL
+if use_web_search:
+    tav = Tavily(prompt_config["tavily_api_key"])
+    tav_res = tav.retrieve_chunks(" ".join(questions))
+    kbinfos["chunks"].extend(tav_res["chunks"])
+    kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
+```
+
+如果用户开启了 internet / Tavily 搜索，RAGFlow 会把联网搜索结果也转成 chunks，加到 kbinfos 里。
+
+也就是说，最终上下文可能来自两类：
+
+```ABAP
+本地知识库 chunks
+联网搜索 chunks
+```
+
+这就是为什么 kbinfos\["chunks"\] 不一定全部来自 ES / Infinity / OceanBase。
+
+---
+
+### 第四步：可选知识图谱补充。
+
+代码在 api/db/services/dialog\_service\.py \(line 740\)：
+
+```ABAP
+if prompt_config.get("use_kg"):
+    ck = await settings.kg_retriever.retrieval(...)
+    if ck["content_with_weight"]:
+        kbinfos["chunks"].insert(0, ck)
+```
+
+如果开启知识图谱，RAGFlow 会额外调用：
+
+```ABAP
+settings.kg_retriever.retrieval(...)
+```
+
+拿到一个知识图谱召回结果 chunk。
+
+如果有内容，就插到最前面：
+
+```ABAP
+kbinfos["chunks"].insert(0, ck)
+```
+
+插到最前面意味着：
+
+```ABAP
+知识图谱结果优先级较高
+```
+
+它可能用于回答实体关系类问题。
+
+---
+
+### 第五步：引用 metadata 补充。
+
+代码在 api/db/services/dialog\_service\.py \(line 746\)：
+
+```ABAP
+if include_reference_metadata:
+    _enrich_chunks_with_document_metadata(
+        kbinfos.get("chunks", []),
+        metadata_fields
+    )
+```
+
+这一步会给每个 chunk 补上文档级 metadata。
+
+比如文档有元数据：
+
+```JSON
+{
+  "department": "HR",
+  "effective_year": "2025",
+  "doc_owner": "人力资源部"
+}
+```
+
+那么引用 chunk 里可能会补：
+
+```ABAP
+{
+  "document_metadata": {
+    "department": "HR",
+    "effective_year": "2025"
+  }
+}
+```
+
+---
+
+### 第六步：把 chunks 转成 knowledges 文本。
+
+代码在 api/db/services/dialog\_service\.py \(line 754\)：
+
+```ABAP
+knowledges = kb_prompt(kbinfos, max_tokens)
+```
+
+kb\_prompt\(\) 在 rag/prompts/generator\.py \(line 127\)。
+
+它做的事情是：
+
+把结构化 chunks 转成 LLM prompt 里的知识库文本。
+
+它先取出每个 chunk 的正文：
+
+```ABAP
+knowledges = [
+    get_value(ck, "content", "content_with_weight")
+    for ck in kbinfos["chunks"]
+]
+```
+
+然后计算 token 数，避免塞太多：
+
+```ABAP
+if max_tokens * 0.97 < used_token_count:
+    knowledges = knowledges[:i]
+    break
+```
+
+这一步很重要。
+
+即使检索到了很多 chunk，LLM 上下文长度有限，不可能全部塞进去。
+
+所以 kb\_prompt\(\) 会按顺序放，直到接近模型 token 上限。
+
+---
+
+然后它把每个 chunk 格式化成类似这样：
+
+```ABAP
+ID: 0
+├─ Title: 员工手册.pdf
+├─ department: HR
+└─ Content:
+员工迟到超过 30 分钟需提交说明...
+```
+
+代码在 rag/prompts/generator\.py \(line 150\)：
+
+```ABAP
+cnt = "\nID: {}".format(i)
+cnt += draw_node("Title", ...)
+cnt += draw_node("URL", ...)
+...
+cnt += "\n└─ Content:\n"
+cnt += content
+```
+
+所以 LLM 最后看到的不是原始 JSON，而是一段带 ID、标题、metadata、正文的文本。
+
+---
+
+### 第七步：如果没有知识，返回 empty\_response。
+
+代码在 api/db/services/dialog\_service\.py \(line 758\)：
+
+```ABAP
+if not knowledges and prompt_config.get("empty_response"):
+    empty_res = prompt_config["empty_response"]
+    yield {
+        "answer": empty_res,
+        "reference": kbinfos,
+        ...
+    }
+    return
+```
+
+如果没有召回任何可用知识，并且 Chat 配置了空回答，RAGFlow 直接返回：
+
+```ABAP
+Sorry! No relevant content was found in the knowledge base!
+```
+
+或者用户自定义的空回答。
+
+这避免 LLM 在没有依据时乱答。
+
+---
+
+### 第八步：把 knowledge 放进 kwargs。
+
+代码在 api/db/services/dialog\_service\.py \(line 763\)：
+
+```ABAP
+kwargs["knowledge"] = "\n------\n" + "\n\n------\n\n".join(knowledges)
+```
+
+这里就是把多个知识片段用分隔线拼起来。
+
+最终 kwargs\["knowledge"\] 可能长这样：
+
+```ABAP
+------
+ID: 0
+Title: 员工手册.pdf
+Content:
+员工迟到超过 30 分钟需提交说明...
+
+------
+
+ID: 1
+Title: 考勤制度.pdf
+Content:
+迟到三次以上需由直属主管约谈...
+```
+
+下一模块构造 prompt 时，系统提示词里的：
+
+```ABAP
+{knowledge}
+```
+
+就会被替换成这段内容
+
+---
+
+所以第 5 大模块完整流程是：
+
+```YAML
+kbinfos = retrieval 返回结果
+  |
+  v
+可选 toc_enhance
+  |
+  v
+父子 chunk 补全 retrieval_by_children
+  |
+  v
+可选 Tavily 联网搜索补充
+  |
+  v
+可选 KG 知识图谱补充
+  |
+  v
+可选 document metadata 补充
+  |
+  v
+kb_prompt(kbinfos, max_tokens)
+  |
+  v
+生成 knowledges 文本
+  |
+  v
+如果为空，返回 empty_response
+  |
+  v
+kwargs["knowledge"] = 拼接后的知识上下文
+```
