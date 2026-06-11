@@ -1,0 +1,417 @@
+## 第八部分：日志、错误处理与结果保存。
+
+这一部分会讲
+
+```ABAP
+1. 运行日志怎么产生
+   workflow_started
+   node_started
+   node_finished
+   message
+   message_end
+   workflow_finished
+
+2. 日志怎么返回给前端
+   Canvas.run() yield 事件
+   /agents/chat/completions 用 SSE 推送
+
+3. 工具调用 trace 怎么记录
+   tool_use_callback()
+   Redis key: task_id-message_id-logs
+
+4. 错误怎么处理
+   组件内部 try/except
+   _ERROR 输出
+   exception_method
+   exception_default_value
+   exception_goto
+
+5. 流程失败后怎么中断
+   canvas.error
+   Runtime Error
+
+6. 结果怎么保存
+   API4Conversation.message
+   API4Conversation.reference
+   API4Conversation.errors
+   API4Conversation.dsl
+
+7. 为什么会话可以恢复
+   因为 conv.dsl 保存了运行后的 Canvas 状态
+```
+
+核心代码会集中在：
+
+```ABAP
+agent/component/base.py
+  ComponentBase.invoke()
+  ComponentBase.exception_handler()
+
+agent/canvas.py
+  Canvas.run()
+  tool_use_callback()
+  get_reference()
+
+api/db/services/canvas_service.py
+  completion()
+  保存 message / reference / errors / dsl
+
+api/apps/restful_apis/agent_api.py
+  _run_workflow_session()
+  SSE 返回事件
+```
+
+
+
+### 先看组件错误怎么捕获。
+
+每个组件真正执行时，都会走 ComponentBase\.invoke\(\) 或 invoke\_async\(\)。
+
+代码在：
+
+agent/component/base\.py \(line 407\)
+
+```Python
+def invoke(self, **kwargs):
+    self.set_output("_created_time", time.perf_counter())
+    try:
+        self._invoke(**kwargs)
+    except Exception as e:
+        if self.get_exception_default_value():
+            self.set_exception_default_value()
+        else:
+            self.set_output("_ERROR", str(e))
+        logging.exception(e)
+    self.set_output("_elapsed_time", ...)
+    return self.output()
+```
+
+也就是说，组件内部 \_invoke\(\) 报错时，RAGFlow 不会立刻让整个 Python 程序崩掉，而是先把错误写进当前组件的输出：
+
+```ABAP
+_ERROR = 错误信息
+```
+
+所以错误也是一种组件输出。
+
+---
+
+### 然后 Canvas\.run\(\) 会检查这个组件有没有错误。
+
+代码在：
+
+agent/canvas\.py \(line 580\)
+
+```Python
+if cpn_obj.error():
+    ex = cpn_obj.exception_handler()
+    if ex and ex["goto"]:
+        self.path.extend(ex["goto"])
+        other_branch = True
+    elif ex and ex["default_value"]:
+        yield decorate("message", {"content": ex["default_value"]})
+        yield decorate("message_end", {})
+    else:
+        self.error = cpn_obj.error()
+```
+
+这段很关键。
+
+它说明组件报错后有三种处理方式：
+
+```ABAP
+1. exception_goto
+   出错后跳到指定节点继续执行
+
+2. exception_default_value
+   出错后返回一个默认值 / 默认消息
+
+3. 没有配置异常处理
+   写入 canvas.error，流程中断
+```
+
+所以 RAGFlow 的错误处理不是只有 try/except，而是可以在画布层配置异常策略。
+
+---
+
+这些异常配置来自组件参数。
+
+在：
+
+agent/component/base\.py \(line 603\)
+
+```Python
+def exception_handler(self):
+    if not self._param.exception_method:
+        return None
+    return {
+        "goto": self._param.exception_goto,
+        "default_value": self._param.exception_default_value
+    }
+```
+
+所以组件参数里有：
+
+```ABAP
+exception_method
+exception_default_value
+exception_goto
+```
+
+这就是画布里“出错后怎么办”的基础。
+
+---
+
+### 再看日志。
+
+Canvas\.run\(\) 在执行过程中会不断 yield 事件。
+
+比如节点开始：
+
+agent/canvas\.py \(line 504\)
+
+```ABAP
+yield decorate("node_started", {...})
+```
+
+节点结束：
+
+```ABAP
+yield _node_finished(cpn_obj)
+```
+
+消息输出：
+
+```ABAP
+yield decorate("message_end", message_end)
+```
+
+流程结束：
+
+agent/canvas\.py \(line 653\)
+
+```ABAP
+yield decorate("workflow_finished", {...})
+```
+
+所以前端看到的运行过程，本质就是这些事件：
+
+```ABAP
+workflow_started
+node_started
+node_finished
+message
+message_end
+workflow_finished
+```
+
+---
+
+这些事件会被外层接口用 SSE 发给前端。
+
+在：
+
+api/db/services/canvas\_service\.py \(line 353\)
+
+```ABAP
+async for ans in canvas.run(**run_kwargs):
+    ans["session_id"] = session_id
+    yield "data:" + json.dumps(ans, ensure_ascii=False) + "\n\n"
+```
+
+所以链路是：
+
+```ABAP
+Canvas.run()
+   ↓
+yield event
+   ↓
+接口包装成 data: xxx
+   ↓
+SSE 推给前端
+```
+
+这就是前端能实时看到节点运行状态的原因。
+
+---
+
+### 工具调用还有一套 trace 日志。
+
+代码在：
+
+agent/canvas\.py \(line 780\)
+
+```ABAP
+def tool_use_callback(self, agent_id, func_name, params, result, elapsed_time=None):
+```
+
+它会把工具调用记录写到 Redis：
+
+```ABAP
+REDIS_CONN.set_obj(
+    f"{self.task_id}-{self.message_id}-logs",
+    obj,
+    60*10
+)
+```
+
+记录内容包括：
+
+```ABAP
+component_id
+tool_name
+arguments
+result
+elapsed_time
+```
+
+所以如果 Agent 节点调用了工具，比如：
+
+```ABAP
+Retrieval
+Google
+ExeSQL
+TavilySearch
+CodeExec
+```
+
+这些工具调用轨迹可以被记录下来。
+
+对应查询接口在：
+
+api/apps/restful\_apis/agent\_api\.py \(line 843\)
+
+```ABAP
+@manager.route("/agents/<agent_id>/logs/<message_id>", methods=["GET"])
+```
+
+也就是说：
+
+```ABAP
+普通节点运行事件:
+  通过 SSE 返回
+
+工具调用详细 trace:
+  临时存在 Redis，前端再按 message_id 查询
+```
+
+---
+
+### 最后看结果怎么保存。
+
+在：
+
+api/db/services/canvas\_service\.py \(line 340\)
+
+执行前会先保存用户消息：
+
+```ABAP
+conv.message.append({
+    "role": "user",
+    "content": query,
+    "id": message_id,
+    "files": files
+})
+```
+
+执行过程中，如果收到 message 事件，会累积答案文本：
+
+```ABAP
+if ans["event"] == "message":
+    txt += ans["data"]["content"]
+```
+
+执行结束后，保存 assistant 消息：
+
+```ABAP
+conv.message.append({
+    "role": "assistant",
+    "content": txt,
+    "created_at": time.time(),
+    "id": message_id
+})
+```
+
+然后保存引用、错误和运行后的 DSL：
+
+```ABAP
+conv.reference = canvas.get_reference()
+conv.errors = canvas.error
+conv.dsl = str(canvas)
+```
+
+最后写回数据库：
+
+```ABAP
+API4ConversationService.append_message(conv["id"], conv)
+```
+
+所以最终会话里保存了：
+
+```ABAP
+message
+  用户问题 + assistant 答案
+
+reference
+  检索引用 / 文档片段
+
+errors
+  Canvas 运行错误
+
+dsl
+  运行后的 Canvas 状态
+```
+
+---
+
+这里的 conv\.dsl = str\(canvas\) 很重要。
+
+它说明 RAGFlow 会把运行后的 Canvas 状态重新序列化保存。
+
+这样下一轮继续这个 session 时，就可以从会话里的 DSL 恢复，而不是重新从最新画布开始。
+
+所以它支持：
+
+```ABAP
+多轮对话
+中间状态保留
+history 保留
+retrieval/reference 保留
+path 状态保留
+```
+
+---
+
+### 这一节总结成一条链路就是：
+
+```ABAP
+组件执行
+   ↓
+ComponentBase.invoke()
+   ↓
+成功：set_output(...)
+失败：set_output("_ERROR", ...)
+   ↓
+Canvas.run() 检查 error
+   ├─ 有 exception_goto：跳转其他节点
+   ├─ 有 default_value：输出默认消息
+   └─ 无处理：canvas.error，流程中断
+   ↓
+Canvas.run() yield 事件
+   ↓
+SSE 返回前端
+   ↓
+工具 trace 写 Redis
+   ↓
+运行结束保存 API4Conversation
+   ├─ message
+   ├─ reference
+   ├─ errors
+   └─ dsl
+```
+
+### 一句话总结：
+
+> 第八部分就是 RAGFlow 的运行闭环：组件执行时产生日志和错误，Canvas 把节点状态、消息、异常、引用都包装成事件流返回前端；工具调用 trace 临时写 Redis；最终会话结果、引用、错误和运行后的 DSL 写回 API4Conversation，从而支持前端展示、日志追踪和后续会话恢复。
+> 
+> 
